@@ -46,63 +46,26 @@ TARTARUS_PRODUCT_IDS = {
 
 # ── Key signatures used to identify each sub-device ──────────
 def find_tartarus_devices():
-    """
-    Dynamically find the three Tartarus evdev devices by USB ID
-    and capability fingerprint. Returns (keys_dev, mouse_dev, analog_dev)
-    or raises RuntimeError if not found.
-    """
+    """Return every Tartarus evdev node that can emit a mapped key."""
     import evdev as _evdev
-    candidates = []
+    mapped = {ecodes.ecodes[n] for n in ALL_KEY_MAP}
+    found = []
     for path in _evdev.list_devices():
         try:
             dev = _evdev.InputDevice(path)
-            info = dev.info
-            if info.vendor == TARTARUS_VENDOR_ID and info.product in TARTARUS_PRODUCT_IDS:
-                candidates.append(dev)
-            else:
-                dev.close()
         except Exception:
-            pass
-
-    if not candidates:
-        raise RuntimeError("Razer Tartarus not found. Is it plugged in?")
-
-    keys_dev   = None
-    mouse_dev  = None
-    analog_dev = None
-
-    for dev in candidates:
-        caps = dev.capabilities()
-        keys = caps.get(ecodes.EV_KEY, [])
-        rels = caps.get(ecodes.EV_REL, [])
-
-        has_space    = ecodes.KEY_SPACE  in keys
-        has_middle   = ecodes.BTN_MIDDLE in keys
-        has_wheel    = ecodes.REL_WHEEL  in rels
-        has_q        = ecodes.KEY_Q      in keys
-        has_abs = bool(caps.get(ecodes.EV_ABS, []))
-
-        if has_middle and has_wheel and not has_q:
-            mouse_dev = dev
-        elif has_space and has_q and has_abs and has_wheel:
-            keys_dev = dev
-        elif has_space and has_q and not has_abs:
-            analog_dev = dev
+            continue
+        info = dev.info
+        keys = set(dev.capabilities().get(ecodes.EV_KEY, []))
+        if (info.vendor == TARTARUS_VENDOR_ID
+                and info.product in TARTARUS_PRODUCT_IDS
+                and keys & mapped):
+            found.append(dev)
         else:
             dev.close()
-
-    missing = []
-    if not keys_dev:   missing.append("keys")
-    if not mouse_dev:  missing.append("mouse/scroll")
-    if not analog_dev: missing.append("analog stick")
-
-    if missing:
-        remaining = [d for d in candidates if d not in (keys_dev, mouse_dev, analog_dev)]
-        if not keys_dev and remaining:   keys_dev   = remaining.pop(0)
-        if not mouse_dev and remaining:  mouse_dev  = remaining.pop(0)
-        if not analog_dev and remaining: analog_dev = remaining.pop(0)
-
-    return keys_dev, mouse_dev, analog_dev
+    if not found:
+        raise RuntimeError("Razer Tartarus not found. Is it plugged in?")
+    return found
 
 
 TARTARUS_KEY_MAP = {}
@@ -126,6 +89,8 @@ ANALOG_DEVICE_MAP = {
     "KEY_LEFT":    "analog_left",
     "KEY_RIGHT":   "analog_right",
 }
+
+ALL_KEY_MAP = {**KEYS_DEVICE_MAP, **MOUSE_DEVICE_MAP, **ANALOG_DEVICE_MAP}
 
 # ── Key name -> evdev code ─────────────────────────────────────
 def key_name_to_code(name):
@@ -276,40 +241,22 @@ class DaemonThread(QThread):
     def setup_devices(self):
         global TARTARUS_KEY_MAP
         try:
-            keys_dev, mouse_dev, analog_dev = find_tartarus_devices()
+            nodes = find_tartarus_devices()
         except RuntimeError as e:
             self.status_changed.emit(str(e))
             return
-
-        TARTARUS_KEY_MAP = {}
-
-        if keys_dev:
-            for keycode, tid in KEYS_DEVICE_MAP.items():
-                TARTARUS_KEY_MAP[(keys_dev.path, keycode)] = tid
-            self.status_changed.emit(f"Keys device: {keys_dev.path}")
-
-        if mouse_dev:
-            for keycode, tid in MOUSE_DEVICE_MAP.items():
-                TARTARUS_KEY_MAP[(mouse_dev.path, keycode)] = tid
-            self.status_changed.emit(f"Mouse device: {mouse_dev.path}")
-
-        if analog_dev:
-            for keycode, tid in ANALOG_DEVICE_MAP.items():
-                TARTARUS_KEY_MAP[(analog_dev.path, keycode)] = tid
-            self.status_changed.emit(f"Analog device: {analog_dev.path}")
-
-        for dev in [keys_dev, mouse_dev, analog_dev]:
-            if dev:
-                try:
-                    saved_path = dev.path
-                    dev.close()
-                    dev = InputDevice(saved_path)
-                    dev.grab()
-                    self.devices.append(dev)
-                    self.sel.register(dev, selectors.EVENT_READ)
-                    self.status_changed.emit(f"Grabbed {dev.path} ({dev.name})")
-                except Exception as e:
-                    self.status_changed.emit(f"Could not grab {dev.path}: {e}")
+        TARTARUS_KEY_MAP = dict(ALL_KEY_MAP)
+        for dev in nodes:
+            path = dev.path
+            try:
+                dev.close()
+                dev = InputDevice(path)
+                dev.grab()
+                self.devices.append(dev)
+                self.sel.register(dev, selectors.EVENT_READ)
+                self.status_changed.emit(f"Grabbed {path} ({dev.name})")
+            except Exception as e:
+                self.status_changed.emit(f"Could not grab {path}: {e}")
 
     def reload_mapping(self):
         try:
@@ -353,7 +300,7 @@ class DaemonThread(QThread):
         if isinstance(keycode, list):
             keycode = keycode[0]
 
-        tartarus_id = TARTARUS_KEY_MAP.get((device.path, keycode))
+        tartarus_id = TARTARUS_KEY_MAP.get(keycode)
 
         assignment = self.mapping.get(tartarus_id, {}) if tartarus_id else {}
         mapped_key = assignment.get("key", "").strip()
